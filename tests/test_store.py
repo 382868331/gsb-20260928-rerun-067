@@ -148,3 +148,175 @@ class RunStoreTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# --- follow-up: multi-process competition, takeover, publish interruption ---
+
+import multiprocessing
+import os
+import time
+
+from exp_records.store import RunStore as _RunStore
+
+
+def _make_request(data_path):
+    return ExperimentRequest(
+        inputs=(InputSpec("numbers", data_path),),
+        parameters={"multiplier": 1},
+        environment=default_environment("test/v1"),
+    )
+
+
+def _child_run(store_dir, data_path, result_queue):
+    store = RunStore(store_dir, local_short_compute)
+    summary = store.run(_make_request(data_path))
+    result_queue.put((summary.reused, summary.record_id))
+
+
+def _child_crash_mid_backend(store_dir, data_path, started_path):
+    def backend(inputs, parameters, output_dir):
+        (output_dir / "partial.txt").write_bytes(b"partial")
+        Path(started_path).write_text("started")
+        os._exit(1)  # simulate executor dying mid-run
+
+    store = RunStore(store_dir, backend)
+    store.run(_make_request(data_path))
+
+
+class _CrashAtPublishStore(_RunStore):
+    def _publish_record(self, request_hash, manifest):
+        os._exit(2)  # simulate crash after artifacts are in place
+
+
+def _child_crash_at_publish(store_dir, data_path):
+    store = _CrashAtPublishStore(store_dir, local_short_compute)
+    store.run(_make_request(data_path))
+
+
+def _read_events(store_dir, request_hash):
+    path = store_dir / "attempts" / f"{request_hash}.jsonl"
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+class MultiProcessTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.store_dir = self.root / "store"
+        self.data = self.root / "numbers.txt"
+        self.data.write_bytes(b"shared bytes")
+        self.ctx = multiprocessing.get_context("fork")
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def test_two_competing_processes_single_record(self) -> None:
+        queue = self.ctx.Queue()
+        procs = [
+            self.ctx.Process(target=_child_run, args=(self.store_dir, self.data, queue))
+            for _ in range(2)
+        ]
+        for proc in procs:
+            proc.start()
+        for proc in procs:
+            proc.join(30)
+            self.assertEqual(0, proc.exitcode)
+
+        results = sorted(queue.get() for _ in range(2))
+        self.assertEqual([(False, results[0][1]), (True, results[0][1])], results)
+
+        request_hash = _make_request(self.data).identity()["request_hash"]
+        records = list((self.store_dir / "requests").glob("*.json"))
+        self.assertEqual(1, len(records))
+        events = _read_events(self.store_dir, request_hash)
+        kinds = [event["event"] for event in events]
+        self.assertEqual(1, kinds.count("execute_start"))
+        self.assertEqual(1, kinds.count("published"))
+        self.assertEqual(1, kinds.count("reused"))
+        self.assertEqual(2, len({event["executor_id"] for event in events}))
+
+    def test_takeover_after_executor_exit(self) -> None:
+        started = self.root / "started.txt"
+        proc = self.ctx.Process(
+            target=_child_crash_mid_backend, args=(self.store_dir, self.data, started)
+        )
+        proc.start()
+        proc.join(30)
+        self.assertEqual(1, proc.exitcode)
+        self.assertTrue(started.exists())
+
+        request_hash = _make_request(self.data).identity()["request_hash"]
+        # staging leftovers from the dead executor must not be a cache hit
+        self.assertFalse((self.store_dir / "requests" / f"{request_hash}.json").exists())
+
+        summary = RunStore(self.store_dir, local_short_compute).run(_make_request(self.data))
+        self.assertFalse(summary.reused)
+        self.assertEqual(1, len(list((self.store_dir / "requests").glob("*.json"))))
+        self.assertEqual([], list((self.store_dir / "staging").iterdir()))
+
+        events = _read_events(self.store_dir, request_hash)
+        starts = [event for event in events if event["event"] == "execute_start"]
+        self.assertEqual(2, len(starts))
+        takeover = starts[1].get("takeover_basis")
+        self.assertIsNotNone(takeover)
+        self.assertEqual(1, len(takeover["orphaned_attempts"]))
+        self.assertIn("stale_staging_dirs", takeover)
+        self.assertEqual(1, len([e for e in events if e["event"] == "published"]))
+
+    def test_publish_interruption_leaves_no_trusted_record(self) -> None:
+        proc = self.ctx.Process(
+            target=_child_crash_at_publish, args=(self.store_dir, self.data)
+        )
+        proc.start()
+        proc.join(30)
+        self.assertEqual(2, proc.exitcode)
+
+        request_hash = _make_request(self.data).identity()["request_hash"]
+        # artifacts were published but the record was not: nothing to trust
+        self.assertTrue((self.store_dir / "artifacts" / request_hash).is_dir())
+        self.assertFalse((self.store_dir / "requests" / f"{request_hash}.json").exists())
+
+        summary = RunStore(self.store_dir, local_short_compute).run(_make_request(self.data))
+        self.assertFalse(summary.reused)
+        records = list((self.store_dir / "requests").glob("*.json"))
+        self.assertEqual(1, len(records))
+
+        events = _read_events(self.store_dir, request_hash)
+        starts = [event for event in events if event["event"] == "execute_start"]
+        takeover = starts[-1].get("takeover_basis")
+        self.assertIsNotNone(takeover)
+        self.assertTrue(takeover["artifacts_without_record"])
+
+    def test_corrupted_artifact_detected_after_reopen(self) -> None:
+        first = RunStore(self.store_dir, local_short_compute).run(_make_request(self.data))
+        self.assertFalse(first.reused)
+
+        # corrupt one artifact after the record was published
+        artifact = first.artifact_dir / "result.json"
+        artifact.write_bytes(b"tampered")
+
+        reopened = RunStore(self.store_dir, local_short_compute).run(_make_request(self.data))
+        self.assertFalse(reopened.reused)
+        self.assertEqual(1, len(list((self.store_dir / "requests").glob("*.json"))))
+        manifest = json.loads(reopened.record_path.read_text(encoding="utf-8"))
+        for item in manifest["artifacts"]:
+            data = (reopened.artifact_dir / item["path"]).read_bytes()
+            import hashlib
+
+            self.assertEqual(item["sha256"], hashlib.sha256(data).hexdigest())
+
+        events = _read_events(self.store_dir, reopened.request_hash)
+        starts = [event for event in events if event["event"] == "execute_start"]
+        takeover = starts[-1].get("takeover_basis")
+        self.assertIsNotNone(takeover)
+        self.assertTrue(takeover["record_failed_verification"])
+
+    def test_same_filename_different_content_stays_distinct(self) -> None:
+        shared = self.root / "shared.txt"
+        shared.write_bytes(b"version one")
+        first = RunStore(self.store_dir, local_short_compute).run(_make_request(shared))
+        shared.write_bytes(b"version two")
+        second = RunStore(self.store_dir, local_short_compute).run(_make_request(shared))
+        self.assertNotEqual(first.record_id, second.record_id)
+        self.assertFalse(second.reused)
+        self.assertEqual(2, len(list((self.store_dir / "requests").glob("*.json"))))

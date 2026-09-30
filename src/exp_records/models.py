@@ -6,7 +6,7 @@ import platform
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 SCHEMA_VERSION = "experiment-record/v1"
@@ -92,3 +92,13 @@ class RecordSummary:
     reused: bool
     record_path: Path
     artifact_dir: Path
+
+
+@dataclass(frozen=True)
+class Stage:
+    name: str
+    compute: Callable[..., Any]
+    version: str = "v1"
+    inputs: tuple[str, ...] | None = None
+    parameters: tuple[str, ...] | None = None
+    depends_on: tuple[str, ...] = ()

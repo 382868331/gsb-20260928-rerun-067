@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import tempfile
 import threading
 import unittest
 from pathlib import Path
 
 from exp_records.backends import local_short_compute
-from exp_records.models import ExperimentRequest, InputSpec, default_environment
+from exp_records.models import ExperimentRequest, InputSpec, Stage, default_environment
 from exp_records.store import RunStore
 
 
@@ -89,6 +90,8 @@ class RunStoreTests(unittest.TestCase):
         self.assertEqual([], list((self.store_dir / "requests").glob("*.json")))
         self.assertFalse((self.store_dir / "artifacts" / request.identity()["request_hash"]).exists())
         self.assertEqual([], list((self.store_dir / "staging").iterdir()))
+        evidence = self.store_dir / "evidence" / request.identity()["request_hash"]
+        self.assertTrue(any(evidence.rglob("partial.txt")))
 
     def test_failed_rewrite_preserves_previous_complete_record(self) -> None:
         complete = RunStore(self.store_dir, local_short_compute).run(
@@ -144,6 +147,123 @@ class RunStoreTests(unittest.TestCase):
         self.assertEqual(2, len(results))
         self.assertEqual(1, calls)
         self.assertEqual(1, len(list((self.store_dir / "requests").glob("*.json"))))
+
+
+class PipelineTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.store_dir = self.root / "store"
+        self.data = self.root / "numbers.txt"
+        self.data.write_bytes(b"pipeline input")
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def test_partial_rerun_reuses_verified_stage_sources(self) -> None:
+        prepare_calls = []
+        render_calls = []
+
+        def prepare(inputs, parameters, dependencies, output_dir):
+            prepare_calls.append(inputs["numbers"])
+            (output_dir / "prepared.bin").write_bytes(inputs["numbers"] + b"|prepared")
+            return {"step": "prepare"}
+
+        def render(inputs, parameters, dependencies, output_dir):
+            render_calls.append((inputs["template"], list(dependencies)))
+            prepared = (dependencies["prepare"] / "prepared.bin").read_bytes()
+            (output_dir / "image.svg").write_text(
+                f"<svg>{prepared.decode()} {inputs['template'].decode()}</svg>",
+                encoding="utf-8",
+            )
+            (output_dir / "params.txt").write_text("rendered", encoding="utf-8")
+            return {"step": "render"}
+
+        stages = (
+            Stage("prepare", prepare, inputs=("numbers",)),
+            Stage("render", render, inputs=("template",), depends_on=("prepare",)),
+        )
+        template_one = self.root / "template-one.txt"
+        template_two = self.root / "template-two.txt"
+        template_one.write_bytes(b"template one")
+        template_two.write_bytes(b"template two")
+
+        first_store = RunStore(self.store_dir, local_short_compute)
+        first_request = ExperimentRequest(
+            inputs=(
+                InputSpec("numbers", self.data),
+                InputSpec("template", template_one),
+            ),
+            environment=default_environment("test/v1"),
+        )
+        first = first_store.run_pipeline(first_request, stages)
+
+        second_request = ExperimentRequest(
+            inputs=(
+                InputSpec("numbers", self.data),
+                InputSpec("template", template_two),
+            ),
+            environment=default_environment("test/v1"),
+        )
+        second = RunStore(self.store_dir, local_short_compute).run_pipeline(
+            second_request, stages
+        )
+
+        self.assertEqual(1, len(prepare_calls))
+        self.assertEqual(2, len(render_calls))
+        self.assertNotEqual(first.record_id, second.record_id)
+        first_manifest = json.loads(first.record_path.read_text(encoding="utf-8"))
+        second_manifest = json.loads(second.record_path.read_text(encoding="utf-8"))
+        first_provenance = first_manifest["backend_metadata"]["pipeline"]
+        second_provenance = second_manifest["backend_metadata"]["pipeline"]
+        self.assertEqual(False, first_provenance[0]["reused"])
+        self.assertEqual(True, second_provenance[0]["reused"])
+        self.assertEqual(False, second_provenance[1]["reused"])
+        self.assertEqual(
+            first_provenance[0]["stage_hash"], second_provenance[0]["stage_hash"]
+        )
+        self.assertNotEqual(
+            first_provenance[1]["stage_hash"], second_provenance[1]["stage_hash"]
+        )
+        copied_stage_record = second.artifact_dir / "stages" / "prepare" / "stage-manifest.json"
+        copied = json.loads(copied_stage_record.read_text(encoding="utf-8"))
+        self.assertEqual(
+            second_provenance[0]["source_stage_record_sha256"],
+            hashlib.sha256(copied_stage_record.read_bytes()).hexdigest(),
+        )
+        self.assertEqual(copied["stage_hash"], second_provenance[0]["stage_hash"])
+
+    def test_failed_stage_leaves_evidence_and_reuses_earlier_stage(self) -> None:
+        calls = {"prepare": 0, "render": 0}
+
+        def prepare(inputs, parameters, dependencies, output_dir):
+            calls["prepare"] += 1
+            (output_dir / "prepared.bin").write_bytes(b"prepared")
+            return {}
+
+        def failing_render(inputs, parameters, dependencies, output_dir):
+            calls["render"] += 1
+            (output_dir / "partial.png").write_bytes(b"partial")
+            raise RuntimeError("render failed")
+
+        stages = (
+            Stage("prepare", prepare),
+            Stage("render", failing_render, depends_on=("prepare",)),
+        )
+        request = request_from_files({"numbers": self.data})
+        store = RunStore(self.store_dir, local_short_compute)
+        with self.assertRaises(RuntimeError):
+            store.run_pipeline(request, stages)
+        with self.assertRaises(RuntimeError):
+            store.run_pipeline(request, stages)
+
+        self.assertEqual(1, calls["prepare"])
+        self.assertEqual(2, calls["render"])
+        evidence_root = self.store_dir / "evidence" / "stages"
+        self.assertTrue(any(evidence_root.rglob("partial.png")))
+        self.assertFalse(
+            list((self.store_dir / "stage_staging").glob("*/**/partial.png"))
+        )
 
 
 if __name__ == "__main__":
@@ -280,6 +400,11 @@ class MultiProcessTests(unittest.TestCase):
         self.assertFalse(summary.reused)
         records = list((self.store_dir / "requests").glob("*.json"))
         self.assertEqual(1, len(records))
+        self.assertTrue(
+            any(
+                (self.store_dir / "evidence" / request_hash).rglob("summary.txt")
+            )
+        )
 
         events = _read_events(self.store_dir, request_hash)
         starts = [event for event in events if event["event"] == "execute_start"]

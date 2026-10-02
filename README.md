@@ -20,6 +20,25 @@
 - 重新打开存储时逐个校验产物的 SHA-256，损坏产物会被识别并触发重新执行，不会无条件复用。
 - 计算后端位于独立接口之后；后续替换后端时，记录字段和身份语义保持不变。
 
+## 分阶段复用与候选比较
+
+`exp_records.rounds` 在整请求记录之上提供分阶段管线，回答“改几个参数后哪些计算还能继续用”：
+
+- 每个阶段显式声明它依赖的输入、参数子集和上游阶段；阶段身份只由这些内容的 SHA-256 决定，多个参数共同作用于同一阶段时任一个变化都会改变身份，未声明的参数不影响该阶段。
+- 上游中间产物按（阶段哈希, 产物路径, 产物摘要）引用，同一路径被多条路径引用时逐份核对；文件名相同但内容不同绝不会命中复用。
+- 一轮比较包含一个基准和多个候选修订，规划结果按三类并列展示：`confirmed`（已确认、可复用，并标注原实验/候选身份）、`rerun`（依据成立但需要重做，给出参数/输入/上游变化原因）、`unproven`（上游缺失、失败或损坏，本阶段身份尚不能证明）。
+- 用户只采纳修订中的部分参数时，整个候选从基准参数重新规划，不会混入未采纳参数或另一候选尚未确认的结果；参数改回原值时命中原实验的已确认阶段。
+- 共享产物损坏后会被隔离为证据并只重做受影响的依赖链；某阶段失败时其下游标记为 `unproven`，失败暂存产物、错误与回溯完整保存在 `evidence/`，不发布不可信记录。
+- 每轮保存 `rounds/<id>.request.json` 与 `rounds/<id>.json`；重开后 `trace_final_result` 逐件复核最终产物摘要并给出到原始实验身份的完整来源链，同时列出该轮被放弃的计算证据。
+
+分阶段命令示例：
+
+    python -m exp_records.cli compare-round --store ./example-store --round r1 \
+      --input raw=./raw.txt --param seed=1 --param multiplier=2 --param offset=0 \
+      --candidate '{"id":"original","adjustments":{}}' \
+      --candidate '{"id":"bump_offset","adjustments":{"offset":9}}'
+    python -m exp_records.cli trace-round --store ./example-store --round r1
+
 ## 本地运行
 
     python -m exp_records.cli run --store ./example-store --input numbers=./numbers.txt --param multiplier=2

@@ -24,8 +24,22 @@
 
     python -m exp_records.cli run --store ./example-store --input numbers=./numbers.txt --param multiplier=2
 
-多次执行同一命令会输出 reused=true。把文件换成不同路径但保持内容相同仍会复用；改变任意字节则会重新执行。
-
-## 测试
+ 多次执行同一命令会输出 reused=true。把文件换成不同路径但保持内容相同仍会复用；改变任意字节则会重新执行。
+ 
+ ## 候选结果的冻结与移交
+ 
+ 冻结把选定候选（request hash）连同其记录与产物打包成一份可移交材料，接收者无需原工作目录即可逐件核对。
+ 
+ - 冻结前先预览：`freeze-plan` 把每个候选分类为 confirmed（记录与产物校验通过）、needs_redo（记录缺失、产物损坏、输入在选择后被替换或仍有阶段未结束）、unproven（只有产物没有可信记录）。任何非 confirmed 的候选都会使冻结中止并明确列出，不会把目录里现成的同名文件装进包，也不会混入其他候选未确认的结果。
+ - 选择可以只采纳候选的一部分参数决定：`--selections` JSON 文件中每个条目支持 adopted_parameters（缺省为全部采纳）、reason（采用原因）和 expected_inputs（选择时看到的输入摘要，用于发现输入被替换）。内容相同但来源不同的材料各自记录采用原因。
+ - 冻结时重新核对依赖；多个候选共享的内容相同产物在包内按 SHA-256 只存一份。包写入暂存目录后原子发布，package_id 由内容决定，已发布的包不可变，重复冻结同一内容会报错。
+ - 后续重新计算或补齐缺失内容时，用 `--supersedes` 指向上一版包生成新版本；新清单记录 version、supersedes 和 changes（新增、移除、替换的候选及依据），原版本保持不变。
+ - 接收者用 `import-package` 逐件验证：每个产物核对 SHA-256，每条记录重算请求哈希并核对产物引用，通过后才装入本地存储。重复导入同一包幂等，已存在的记录标记 already_present，不产生第二套来源。任何一件缺失或校验失败，整包不得标为 verified_complete。导入的记录可直接被 `run` 复用，从最终结果追溯到实际采用的原实验，无需猜原文件路径。
+ 
+     python -m exp_records.cli freeze-plan --store ./example-store --select <hash>
+     python -m exp_records.cli freeze --store ./example-store --output ./packages --select <hash>
+     python -m exp_records.cli import-package --store ./receiver-store --package ./packages/<package_id>
+ 
+ ## 测试
 
     python -m unittest discover -s tests -v

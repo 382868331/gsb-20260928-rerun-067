@@ -194,6 +194,78 @@ class RunStore:
                 finally:
                     fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
+    def install_record(
+        self, manifest: dict[str, Any], artifact_contents: dict[str, bytes]
+    ) -> RecordSummary:
+        """Install an externally verified record (e.g. from a freeze package).
+
+        The manifest and artifact bytes are re-verified locally; an identical
+        complete record already in the store is reused as-is so repeated
+        imports never create duplicate provenance.
+        """
+        request_hash = manifest.get("record_id")
+        payload = manifest.get("request")
+        if not isinstance(request_hash, str) or not isinstance(payload, dict):
+            raise ValueError("manifest is missing record_id or request payload")
+        recomputed = hashlib.sha256(canonical_json(payload)).hexdigest()
+        if recomputed != request_hash:
+            raise ValueError("manifest request payload does not match record_id")
+        artifacts = manifest.get("artifacts")
+        if not isinstance(artifacts, list) or not artifacts:
+            raise ValueError("manifest has no artifacts")
+        for item in artifacts:
+            data = artifact_contents.get(item["path"])
+            if data is None:
+                raise ValueError("missing artifact content for " + item["path"])
+            if len(data) != item["size"] or hashlib.sha256(data).hexdigest() != item["sha256"]:
+                raise ValueError("artifact digest mismatch for " + item["path"])
+
+        lock_path = self.root / "locks" / (request_hash + ".lock")
+        with self._thread_lock_for(request_hash):
+            with lock_path.open("a+") as lock_file:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                try:
+                    existing = self._load_complete(request_hash)
+                    if existing is not None:
+                        return existing
+                    attempt_id = uuid.uuid4().hex
+                    staging_dir = self.root / "staging" / request_hash / attempt_id
+                    artifact_stage = staging_dir / "artifacts"
+                    artifact_stage.mkdir(parents=True)
+                    try:
+                        for item in artifacts:
+                            target = artifact_stage / item["path"]
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            target.write_bytes(artifact_contents[item["path"]])
+                        artifact_target = self.root / "artifacts" / request_hash
+                        if artifact_target.exists():
+                            shutil.rmtree(artifact_target)
+                        os.replace(artifact_stage, artifact_target)
+                        self._fsync_directory(artifact_target.parent)
+                        record_path = self._publish_record(request_hash, manifest)
+                        shutil.rmtree(self.root / "staging" / request_hash, ignore_errors=True)
+                    except BaseException:
+                        shutil.rmtree(self.root / "staging" / request_hash, ignore_errors=True)
+                        raise
+                    self._append_attempt_event(
+                        request_hash,
+                        {
+                            "event": "installed",
+                            "attempt_id": attempt_id,
+                            "record_id": request_hash,
+                            "source": "freeze-package",
+                        },
+                    )
+                    return RecordSummary(
+                        request_hash=request_hash,
+                        record_id=request_hash,
+                        reused=False,
+                        record_path=record_path,
+                        artifact_dir=artifact_target,
+                    )
+                finally:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
     def _publish_record(self, request_hash: str, manifest: dict[str, Any]) -> Path:
         record_path = self.root / "requests" / f"{request_hash}.json"
         temporary_path = record_path.with_name(f".{request_hash}.{uuid.uuid4().hex}.tmp")

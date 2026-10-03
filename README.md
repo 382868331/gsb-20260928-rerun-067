@@ -20,6 +20,22 @@
 - 重新打开存储时逐个校验产物的 SHA-256，损坏产物会被识别并触发重新执行，不会无条件复用。
 - 计算后端位于独立接口之后；后续替换后端时，记录字段和身份语义保持不变。
 
+## 可移交冻结包
+
+选定候选结果可以冻结成一份可移交的交付目录（experiment-delivery/v1）：
+
+- 冻结前用 freeze-plan 预览：每个候选被分类为 confirmed（记录完整且校验通过）、needs_rerun（无完整记录）、unproven（目录里有同名文件但无法证明来源）或 blocked（共享依赖损坏、输入在运行后被替换、仍有阶段未结束）。
+- 只有 confirmed 的候选会被装入交付；被阻断的候选及其原因写进 delivery.json，其余候选正常交付，互不影响。
+- 候选可以声明 depends_on 共享中间记录，冻结时重新核验；--derive/--set 支持只采纳某候选的一部分参数决定，派生出的新身份必须先有完整记录才能交付。
+- 交付目录包含 records/（记录清单）、artifacts/（产物）、inputs/（输入快照，接收方无需猜原文件路径）、delivery.json（选择理由与版本差异）和 manifest.json（逐文件 SHA-256）；目录一旦写出即固定，输出目录非空时拒绝覆盖。
+- 每次导出在源存储的 deliveries/ 中登记递增版本，新版本的 changes 字段说明相对上一版的新增、移除与替换及其依据。
+- 接收方 freeze-verify 逐文件校验完整性，freeze-import 只安装全部校验通过的记录；记录身份由请求内容重算，重复导入同一份交付只会复用已有记录，不产生第二套来源；材料不全的交付不会被标成完整实验。
+
+    python -m exp_records.cli freeze-plan --store ./store --select cand-a=<hash> --reason cand-a=采用基准参数 --input cand-a:numbers=./numbers.txt
+    python -m exp_records.cli freeze-export --store ./store --out ./bundle --select cand-a=<hash> --input cand-a:numbers=./numbers.txt
+    python -m exp_records.cli freeze-verify --bundle ./bundle
+    python -m exp_records.cli freeze-import --store ./receiver-store --bundle ./bundle
+
 ## 本地运行
 
     python -m exp_records.cli run --store ./example-store --input numbers=./numbers.txt --param multiplier=2

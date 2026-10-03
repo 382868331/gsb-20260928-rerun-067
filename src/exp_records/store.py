@@ -194,6 +194,139 @@ class RunStore:
                 finally:
                     fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
+    def load_manifest(self, request_hash: str) -> dict[str, Any] | None:
+        """Return the stored manifest only if the record is complete and verifies."""
+        summary = self._load_complete(request_hash)
+        if summary is None:
+            return None
+        try:
+            manifest = json.loads(summary.record_path.read_bytes())
+        except (OSError, json.JSONDecodeError):
+            return None
+        if manifest.get("record_id") != request_hash:
+            return None
+        return manifest
+
+    def record_state(self, request_hash: str) -> dict[str, Any]:
+        """Describe whether a record is complete, in progress, or untraceable."""
+        state: dict[str, Any] = {"request_hash": request_hash, "complete": False}
+        if self._load_complete(request_hash) is not None:
+            state["complete"] = True
+            return state
+
+        record_path = self.root / "requests" / f"{request_hash}.json"
+        artifact_dir = self.root / "artifacts" / request_hash
+        if record_path.is_file():
+            state["record_failed_verification"] = True
+        if artifact_dir.exists() and not record_path.is_file():
+            state["artifacts_without_record"] = True
+
+        events = self._load_attempt_events(request_hash)
+        finished = {
+            event.get("attempt_id")
+            for event in events
+            if event.get("event") in ("published", "failed")
+        }
+        orphaned = [
+            event.get("attempt_id")
+            for event in events
+            if event.get("event") == "execute_start"
+            and event.get("attempt_id") not in finished
+        ]
+        staging_root = self.root / "staging" / request_hash
+        stale_staging = (
+            sorted(entry.name for entry in staging_root.iterdir())
+            if staging_root.is_dir()
+            else []
+        )
+        if orphaned or stale_staging:
+            state["in_progress"] = True
+            if orphaned:
+                state["orphaned_attempts"] = orphaned
+            if stale_staging:
+                state["stale_staging_dirs"] = stale_staging
+        return state
+
+    def install_record(
+        self, manifest: dict[str, Any], artifact_source: str | Path
+    ) -> RecordSummary:
+        """Install a verified record received from a delivery bundle.
+
+        The record identity is recomputed from the embedded request payload, so
+        importing the same delivery twice reuses the existing record instead of
+        creating a second provenance entry.
+        """
+        payload = manifest.get("request")
+        if not isinstance(payload, dict):
+            raise ValueError("manifest is missing the request payload")
+        record_id = hashlib.sha256(canonical_json(payload)).hexdigest()
+        if manifest.get("record_id") != record_id:
+            raise ValueError("manifest record_id does not match its request payload")
+
+        artifact_source = Path(artifact_source)
+        artifacts = manifest.get("artifacts")
+        if not isinstance(artifacts, list) or not artifacts:
+            raise ValueError("manifest has no artifacts")
+        for item in artifacts:
+            path = artifact_source / item["path"]
+            if not path.is_file():
+                raise ValueError(f"missing artifact {item['path']!r}")
+            data = path.read_bytes()
+            if len(data) != item["size"] or hashlib.sha256(data).hexdigest() != item["sha256"]:
+                raise ValueError(f"artifact {item['path']!r} failed verification")
+
+        lock_path = self.root / "locks" / f"{record_id}.lock"
+        with self._thread_lock_for(record_id):
+            with lock_path.open("a+") as lock_file:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                try:
+                    existing = self._load_complete(record_id)
+                    if existing is not None:
+                        self._append_attempt_event(
+                            record_id,
+                            {"event": "reused", "record_id": record_id, "via": "import"},
+                        )
+                        return existing
+
+                    staging_dir = (
+                        self.root / "staging" / record_id / f"import-{uuid.uuid4().hex}"
+                    )
+                    artifact_stage = staging_dir / "artifacts"
+                    artifact_stage.mkdir(parents=True)
+                    try:
+                        for item in artifacts:
+                            target = artifact_stage / item["path"]
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(artifact_source / item["path"], target)
+                        artifact_target = self.root / "artifacts" / record_id
+                        if artifact_target.exists():
+                            shutil.rmtree(artifact_target)
+                        os.replace(artifact_stage, artifact_target)
+                        self._fsync_directory(artifact_target.parent)
+                        record_path = self._publish_record(record_id, manifest)
+                        shutil.rmtree(
+                            self.root / "staging" / record_id, ignore_errors=True
+                        )
+                    except BaseException:
+                        shutil.rmtree(
+                            self.root / "staging" / record_id, ignore_errors=True
+                        )
+                        raise
+
+                    self._append_attempt_event(
+                        record_id,
+                        {"event": "published", "record_id": record_id, "via": "import"},
+                    )
+                    return RecordSummary(
+                        request_hash=record_id,
+                        record_id=record_id,
+                        reused=False,
+                        record_path=record_path,
+                        artifact_dir=artifact_target,
+                    )
+                finally:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
     def _publish_record(self, request_hash: str, manifest: dict[str, Any]) -> Path:
         record_path = self.root / "requests" / f"{request_hash}.json"
         temporary_path = record_path.with_name(f".{request_hash}.{uuid.uuid4().hex}.tmp")

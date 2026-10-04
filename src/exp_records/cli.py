@@ -8,6 +8,7 @@ from typing import Any
 
 from .backends import local_short_compute
 from .freeze import FreezeError, FreezeSelection, freeze, import_package, plan_freeze
+from .history import ImportHistory
 from .models import ExperimentRequest, InputSpec, default_environment
 from .store import RunStore
 
@@ -58,6 +59,13 @@ def build_parser() -> argparse.ArgumentParser:
     import_cmd = subparsers.add_parser("import-package", help="verify and import a freeze package")
     import_cmd.add_argument("--store", required=True, type=Path)
     import_cmd.add_argument("--package", required=True, type=Path)
+
+    history_cmd = subparsers.add_parser(
+        "import-history", help="query persistent import history of the receiver store"
+    )
+    history_cmd.add_argument("--store", required=True, type=Path)
+    history_cmd.add_argument("--package", help="filter by package_id")
+    history_cmd.add_argument("--request", help="filter by request hash")
     return parser
 
 
@@ -128,9 +136,29 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "import-package":
         store = RunStore(args.store, local_short_compute)
-        report = import_package(store, args.package)
+        try:
+            report = import_package(store, args.package)
+        except Exception as exc:  # the failed attempt is already persisted
+            entry = getattr(exc, "entry", None)
+            print(
+                json.dumps(
+                    {"import_result": "failed", "reason": str(exc), "entry": entry},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    indent=2,
+                )
+            )
+            return 1
         print(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2))
         return 0 if report["verified_complete"] else 1
+    if args.command == "import-history":
+        store = RunStore(args.store, local_short_compute)
+        entries = ImportHistory(store).query(
+            package_id=args.package,
+            request_hash=args.request,
+        )
+        print(json.dumps(entries, ensure_ascii=False, sort_keys=True, indent=2))
+        return 0
     raise SystemExit("unknown command: " + args.command)
 
 

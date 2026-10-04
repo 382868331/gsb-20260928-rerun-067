@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .models import SCHEMA_VERSION, canonical_json
+from .history import ImportHistory, manifest_identity
 from .store import RunStore
 
 FREEZE_SCHEMA_VERSION = "freeze-package/v1"
@@ -337,7 +338,117 @@ def import_package(store: RunStore, package_dir: str | Path) -> dict[str, Any]:
     non-complete item keeps the package from being marked verified_complete.
     """
     package_dir = Path(package_dir)
-    manifest = load_package_manifest(package_dir)
+    started_at = datetime.now(timezone.utc).isoformat()
+    try:
+        manifest = load_package_manifest(package_dir)
+    except BaseException as exc:
+        entry = ImportHistory(store).append(
+            {
+                "package_id": None,
+                "source_package": str(package_dir),
+                "started_at": started_at,
+                "ended_at": datetime.now(timezone.utc).isoformat(),
+                "import_result": "failed",
+                "reason": f"{type(exc).__name__}: {exc}",
+                "requests": [],
+            }
+        )
+        raise ImportHistoryError(entry["reason"], entry) from exc
+
+    try:
+        report = _import_package_report(store, package_dir, manifest)
+    except BaseException as exc:
+        ImportHistory(store).append(
+            {
+                "package_id": manifest.get("package_id"),
+                "package_manifest_digest": manifest_identity(manifest),
+                "version": manifest.get("version"),
+                "supersedes": manifest.get("supersedes"),
+                "source_package": str(package_dir),
+                "started_at": started_at,
+                "ended_at": datetime.now(timezone.utc).isoformat(),
+                "import_result": "failed",
+                "reason": f"{type(exc).__name__}: {exc}",
+                "requests": [],
+            }
+        )
+        raise
+
+    selection_reasons = {
+        entry["request_hash"]: entry.get("reason", "")
+        for entry in manifest.get("selections", [])
+        if "request_hash" in entry
+    }
+    covered = {item.get("request_hash") for item in report["records"]}
+    request_results = [
+        {
+            "request_hash": item["request_hash"],
+            "result": item["status"],
+            "reason": item.get("detail", ""),
+            "selection_reason": selection_reasons.get(item["request_hash"], ""),
+            **(
+                {"missing_artifact": item["missing_artifact"]}
+                if "missing_artifact" in item
+                else {}
+            ),
+            **(
+                {"damaged_artifact": item["damaged_artifact"]}
+                if "damaged_artifact" in item
+                else {}
+            ),
+        }
+        for item in report["records"]
+    ]
+    for state in manifest.get("candidate_states", []):
+        if state.get("request_hash") in covered:
+            continue
+        request_results.append(
+            {
+                "request_hash": state.get("request_hash"),
+                "result": state.get("state"),
+                "reason": state.get("detail", ""),
+                "selection_reason": selection_reasons.get(state.get("request_hash"), ""),
+            }
+        )
+    request_results.sort(key=lambda item: item.get("request_hash") or "")
+
+    result_counts: dict[str, int] = {}
+    for item in request_results:
+        result_counts[item["result"]] = result_counts.get(item["result"], 0) + 1
+
+    ImportHistory(store).append(
+        {
+            "package_id": report["package_id"],
+            "package_manifest_digest": manifest_identity(manifest),
+            "version": report["version"],
+            "supersedes": manifest.get("supersedes"),
+            "source_package": str(package_dir),
+            "started_at": started_at,
+            "ended_at": datetime.now(timezone.utc).isoformat(),
+            "import_result": "verified_complete" if report["verified_complete"] else "completed",
+            "verified_complete": report["verified_complete"],
+            "requests": request_results,
+            "result_counts": result_counts,
+        }
+    )
+    return report
+
+
+class ImportHistoryError(RuntimeError):
+    """Raised when an import cannot even start (e.g. unreadable package).
+
+    The failed attempt is still recorded in the receiver's import history.
+    """
+
+    def __init__(self, message: str, entry: dict[str, Any]):
+        super().__init__(message)
+        self.entry = entry
+
+
+def _import_package_report(
+    store: RunStore, package_dir: Path, manifest: dict[str, Any]
+) -> dict[str, Any]:
+    artifact_items: list[dict[str, Any]] = []
 
     artifact_items: list[dict[str, Any]] = []
     verified_blobs: dict[str, bytes] = {}

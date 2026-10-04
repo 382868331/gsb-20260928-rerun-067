@@ -58,6 +58,13 @@ def build_parser() -> argparse.ArgumentParser:
     import_cmd = subparsers.add_parser("import-package", help="verify and import a freeze package")
     import_cmd.add_argument("--store", required=True, type=Path)
     import_cmd.add_argument("--package", required=True, type=Path)
+
+    history_cmd = subparsers.add_parser(
+        "import-history", help="query persistent package import history of a receiver store"
+    )
+    history_cmd.add_argument("--store", required=True, type=Path)
+    history_cmd.add_argument("--package", help="filter to one package id")
+    history_cmd.add_argument("--request", help="filter to one request hash")
     return parser
 
 
@@ -131,6 +138,21 @@ def main(argv: list[str] | None = None) -> int:
         report = import_package(store, args.package)
         print(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2))
         return 0 if report["verified_complete"] else 1
+    if args.command == "import-history":
+        store = RunStore(args.store, local_short_compute)
+        history = store.import_history()
+        if args.request:
+            payload: Any = {
+                "request_hash": args.request,
+                "outcomes": history.request_history(args.request),
+            }
+        else:
+            payload = {
+                "kind": "import-history-query",
+                "entries": history.entries(package_id=args.package),
+            }
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2))
+        return 0
     raise SystemExit("unknown command: " + args.command)
 
 

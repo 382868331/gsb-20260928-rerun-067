@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from .backends import ComputeBackend
+from .import_history import ImportHistory
 from .models import ExperimentRequest, RecordSummary, canonical_json
 
 
@@ -23,8 +24,11 @@ class RunStore:
         self._locks_guard = threading.Lock()
         self._thread_locks: dict[str, threading.Lock] = {}
         self.root.mkdir(parents=True, exist_ok=True)
-        for name in ("requests", "artifacts", "staging", "locks", "attempts"):
+        for name in ("requests", "artifacts", "staging", "locks", "attempts", "import-history"):
             (self.root / name).mkdir(exist_ok=True)
+
+    def import_history(self) -> ImportHistory:
+        return ImportHistory(self.root)
 
     def _thread_lock_for(self, request_hash: str) -> threading.Lock:
         with self._locks_guard:

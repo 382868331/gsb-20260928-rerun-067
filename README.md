@@ -42,8 +42,24 @@
 - 导入报告为每个候选给出明确状态：complete（installed/already_present）、missing（包内缺记录或缺产物）、damaged（摘要不符）、conflict（本地已在使用不同版本）。缺失或损坏只影响对应候选，健康候选照常导入并可被 `run` 复用；缺失内容永远不会被当作可复用记录。
 - 冲突内容不覆盖本地已使用的版本，报告中同时留下本地与 incoming 的产物摘要供核对。
 - 接收方可先导入部分包，再导入 `--supersedes` 的补充包：重叠候选保持唯一（already_present），缺口按补齐安装；只有依赖齐备的请求才会被复用，原始机器目录即使已删除也不影响复用。已发布的旧包保持不可变。
- 
-     python -m exp_records.cli freeze-plan --store ./example-store --select <hash>
+
+## 接收端导入历史
+
+每次 `import-package`（包括重复导入和 `--supersedes` 补发）都会在接收端存储内追加一条持久化记录到 `import-history/entries.jsonl`：
+
+- 包身份：`package_id`、`version`、包内 `freeze-manifest.json` 的 SHA-256、`supersedes` 与 `supplement` 标记。
+- 时间范围：`started_at` 与 `ended_at`（UTC）。
+- 每个请求的结果与原因：`state`（complete/missing/damaged/conflict）、`status`（installed/already_present/…）以及文字原因；补发导入会标记上一版包身份。
+- 重复导入同样追加记录、可追溯，但已存在的记录只标记 `already_present`，绝不重复安装或重新计算。
+- 历史保存在接收端存储目录内，追加写入并 fsync；重启后重新打开存储即可查询，不依赖原始数据目录或原始包目录。
+
+查询入口（也可通过 `RunStore.import_history()` 的 `entries(package_id=...)`、`request_history(request_hash)` 在代码中调用）：
+
+    python -m exp_records.cli import-history --store ./receiver-store
+    python -m exp_records.cli import-history --store ./receiver-store --package <package_id>
+    python -m exp_records.cli import-history --store ./receiver-store --request <hash>
+
+    python -m exp_records.cli freeze-plan --store ./example-store --select <hash>
      python -m exp_records.cli freeze --store ./example-store --output ./packages --select <hash>
      python -m exp_records.cli import-package --store ./receiver-store --package ./packages/<package_id>
  

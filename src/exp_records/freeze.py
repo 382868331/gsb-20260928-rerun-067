@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .import_history import ImportHistory
 from .models import SCHEMA_VERSION, canonical_json
 from .store import RunStore
 
@@ -338,6 +339,8 @@ def import_package(store: RunStore, package_dir: str | Path) -> dict[str, Any]:
     """
     package_dir = Path(package_dir)
     manifest = load_package_manifest(package_dir)
+    started_at = ImportHistory.now()
+    import_id = uuid.uuid4().hex
 
     artifact_items: list[dict[str, Any]] = []
     verified_blobs: dict[str, bytes] = {}
@@ -450,7 +453,7 @@ def import_package(store: RunStore, package_dir: str | Path) -> dict[str, Any]:
     ) and all(
         item["status"] in ("installed", "already_present") for item in record_items
     ) and not declared_states
-    return {
+    report = {
         "schema_version": FREEZE_SCHEMA_VERSION,
         "kind": "import-report",
         "package_id": manifest.get("package_id"),
@@ -461,3 +464,63 @@ def import_package(store: RunStore, package_dir: str | Path) -> dict[str, Any]:
         "selections": manifest.get("selections", []),
         "verified_complete": verified_complete,
     }
+
+    selection_reasons = {
+        entry.get("request_hash"): entry.get("reason", "")
+        for entry in manifest.get("selections", [])
+        if isinstance(entry, dict)
+    }
+    record_statuses = {
+        item["request_hash"]: item["status"] for item in record_items
+    }
+    request_outcomes = []
+    for item in candidates:
+        request_hash = item["request_hash"]
+        state = item["state"]
+        status = record_statuses.get(request_hash, state)
+        reason = item.get("detail", "")
+        if state == STATE_COMPLETE:
+            if status == "installed":
+                reason = "record verified against package contents and installed"
+            elif status == "already_present":
+                reason = "identical verified record already present; import did not reinstall"
+        request_outcomes.append(
+            {
+                "request_hash": request_hash,
+                "state": state,
+                "status": status,
+                "reason": reason,
+                "selection_reason": selection_reasons.get(request_hash, ""),
+            }
+        )
+    request_outcomes.sort(key=lambda outcome: outcome["request_hash"])
+
+    supersedes = manifest.get("supersedes")
+    history_entry = {
+        "kind": "import-history",
+        "import_id": import_id,
+        "package_id": manifest.get("package_id"),
+        "version": manifest.get("version"),
+        "package_path": str(package_dir),
+        "package_manifest_digest": hashlib.sha256(
+            (package_dir / "freeze-manifest.json").read_bytes()
+        ).hexdigest(),
+        "supersedes": supersedes,
+        "supplement": supersedes is not None,
+        "started_at": started_at,
+        "ended_at": ImportHistory.now(),
+        "verified_complete": verified_complete,
+        "requests": request_outcomes,
+        "summary": {
+            "installed": sum(item["status"] == "installed" for item in request_outcomes),
+            "already_present": sum(
+                item["status"] == "already_present" for item in request_outcomes
+            ),
+            "missing": sum(item["state"] == STATE_MISSING for item in request_outcomes),
+            "damaged": sum(item["state"] == STATE_DAMAGED for item in request_outcomes),
+            "conflict": sum(item["state"] == "conflict" for item in request_outcomes),
+        },
+    }
+    store.import_history().append(history_entry)
+    report["import_id"] = import_id
+    return report

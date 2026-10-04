@@ -8,6 +8,8 @@ import unittest
 from pathlib import Path
 
 from exp_records.freeze import (
+    DELIVERY_CORRUPTED,
+    DELIVERY_MISSING,
     FreezeError,
     FreezeSelection,
     freeze,
@@ -42,8 +44,10 @@ class FreezeTests(unittest.TestCase):
         self.store = RunStore(self.root / "store", shared_backend)
         self.req_a = make_request(b"alpha", {"multiplier": 2, "tag": "a"})
         self.req_b = make_request(b"beta", {"multiplier": 3, "tag": "b"})
+        self.req_c = make_request(b"gamma", {"multiplier": 4, "tag": "c"})
         self.sum_a = self.store.run(self.req_a)
         self.sum_b = self.store.run(self.req_b)
+        self.sum_c = self.store.run(self.req_c)
         self.out = self.root / "packages"
 
     def tearDown(self) -> None:
@@ -199,6 +203,100 @@ class FreezeTests(unittest.TestCase):
         result = import_package(receiver, package_dir)
         self.assertFalse(result["verified_complete"])
         self.assertEqual(result["records"][0]["status"], "failed")
+
+    def test_partial_delivery_then_supplement_repairs_and_reports_conflict(self) -> None:
+        selections = [
+            FreezeSelection(self.sum_a.request_hash, reason="candidate a"),
+            FreezeSelection(self.sum_b.request_hash, reason="overlapping healthy candidate"),
+            FreezeSelection(self.sum_c.request_hash, reason="candidate c"),
+        ]
+
+        shared = self.store.root / "artifacts" / self.sum_a.request_hash / "shared.bin"
+        shared.write_bytes(b"corrupted shared dependency")
+        unique_c = self.store.root / "artifacts" / self.sum_c.request_hash / "unique.json"
+        unique_c.unlink()
+
+        first_report = freeze(self.store, selections, self.out)
+        first_package = Path(first_report["path"])
+        first_manifest_bytes = (first_package / "freeze-manifest.json").read_bytes()
+        first_manifest = json.loads(first_manifest_bytes)
+        first_status = {
+            entry["request_hash"]: entry["status"] for entry in first_manifest["candidates"]
+        }
+        self.assertEqual(first_status[self.sum_a.request_hash], DELIVERY_CORRUPTED)
+        self.assertEqual(first_status[self.sum_b.request_hash], "complete")
+        self.assertEqual(first_status[self.sum_c.request_hash], DELIVERY_MISSING)
+        self.assertEqual(first_manifest["records"], [self.sum_b.request_hash])
+
+        receiver = RunStore(self.root / "receiver", shared_backend)
+        first_import = import_package(receiver, first_package)
+        first_record_status = {item["request_hash"]: item["status"] for item in first_import["records"]}
+        self.assertEqual(first_record_status[self.sum_a.request_hash], DELIVERY_CORRUPTED)
+        self.assertEqual(first_record_status[self.sum_b.request_hash], "installed")
+        self.assertEqual(first_record_status[self.sum_c.request_hash], DELIVERY_MISSING)
+        self.assertFalse(first_import["verified_complete"])
+        self.assertTrue(receiver.run(self.req_b).reused)
+        self.assertEqual(1, len(list((receiver.root / "requests").glob("*.json"))))
+
+        shared.write_bytes(b"shared-intermediate-bytes")
+        repaired_dir = self.root / "repair"
+        repaired_dir.mkdir()
+        metadata = shared_backend({"numbers": b"gamma"}, {"multiplier": 4, "tag": "c"}, repaired_dir)
+        self.assertEqual({"backend": "shared/v1"}, metadata)
+        shutil.copyfile(repaired_dir / "unique.json", unique_c)
+
+        # A replacement computation on the sending side produces an internally
+        # valid but different overlapping candidate version.
+        conflict_data = b"different but verifiable overlapping result"
+        conflict_sha = hashlib.sha256(conflict_data).hexdigest()
+        b_artifact_dir = self.store.root / "artifacts" / self.sum_b.request_hash
+        (b_artifact_dir / "alternative.bin").write_bytes(conflict_data)
+        record_b_path = self.store.root / "requests" / (self.sum_b.request_hash + ".json")
+        record_b = json.loads(record_b_path.read_text())
+        record_b["artifacts"] = [
+            {"path": "alternative.bin", "size": len(conflict_data), "sha256": conflict_sha}
+        ]
+        record_b_path.write_text(json.dumps(record_b), encoding="utf-8")
+
+        second_report = freeze(self.store, selections, self.out, supersedes=first_package)
+        second_package = Path(second_report["path"])
+
+        # Source-machine artifacts are no longer needed once published.
+        shutil.rmtree(self.store.root)
+
+        second_import = import_package(receiver, second_package)
+        second_record_status = {
+            item["request_hash"]: item["status"] for item in second_import["records"]
+        }
+        self.assertEqual(second_record_status[self.sum_a.request_hash], "installed")
+        self.assertEqual(second_record_status[self.sum_b.request_hash], "conflict")
+        self.assertEqual(second_record_status[self.sum_c.request_hash], "installed")
+        self.assertFalse(second_import["verified_complete"])
+
+        self.assertTrue(receiver.run(self.req_a).reused)
+        self.assertTrue(receiver.run(self.req_b).reused)
+        self.assertTrue(receiver.run(self.req_c).reused)
+        installed_record = json.loads(
+            (receiver.root / "requests" / (self.sum_b.request_hash + ".json")).read_text()
+        )
+        self.assertEqual({item["path"] for item in installed_record["artifacts"]}, {"shared.bin", "unique.json"})
+        self.assertEqual(3, len(list((receiver.root / "requests").glob("*.json"))))
+
+        self.assertEqual(first_manifest_bytes, (first_package / "freeze-manifest.json").read_bytes())
+        audit_lines = [
+            json.loads(line)
+            for line in (receiver.root / "delivery-imports.jsonl").read_text().splitlines()
+            if line.strip()
+        ]
+        self.assertEqual(2, len(audit_lines))
+        self.assertEqual(first_manifest["package_id"], audit_lines[0]["package_id"])
+        conflict_audit = next(
+            item
+            for item in audit_lines[1]["candidates"]
+            if item["request_hash"] == self.sum_b.request_hash
+        )
+        self.assertEqual("conflict", conflict_audit["status"])
+        self.assertEqual("alternative.bin", conflict_audit["incoming_artifacts"][0]["path"])
 
 
 if __name__ == "__main__":

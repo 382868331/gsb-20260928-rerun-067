@@ -50,6 +50,18 @@ class RunStore:
             stream.flush()
             os.fsync(stream.fileno())
 
+    def append_delivery_event(self, event: dict[str, Any]) -> None:
+        path = self.root / "delivery-imports.jsonl"
+        payload = dict(event)
+        payload.setdefault("executor_id", self.executor_id)
+        payload.setdefault("pid", os.getpid())
+        payload.setdefault("at", self._utcnow())
+        line = json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n"
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(line)
+            stream.flush()
+            os.fsync(stream.fileno())
+
     def _load_attempt_events(self, request_hash: str) -> list[dict[str, Any]]:
         attempts_path = self.root / "attempts" / f"{request_hash}.jsonl"
         events: list[dict[str, Any]] = []

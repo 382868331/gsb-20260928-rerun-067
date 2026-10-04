@@ -13,11 +13,14 @@ from typing import Any
 from .models import SCHEMA_VERSION, canonical_json
 from .store import RunStore
 
-FREEZE_SCHEMA_VERSION = "freeze-package/v1"
+FREEZE_SCHEMA_VERSION = "freeze-package/v2"
 
 STATUS_CONFIRMED = "confirmed"
 STATUS_NEEDS_REDO = "needs_redo"
 STATUS_UNPROVEN = "unproven"
+DELIVERY_COMPLETE = "complete"
+DELIVERY_MISSING = "missing"
+DELIVERY_CORRUPTED = "corrupted"
 
 
 @dataclass(frozen=True)
@@ -73,13 +76,52 @@ def _load_record_manifest(store: RunStore, request_hash: str) -> dict[str, Any] 
 
 
 def plan_item(store: RunStore, selection: FreezeSelection) -> dict[str, Any]:
-    """Classify one selection as confirmed / needs_redo / unproven."""
+    """Classify one selection and describe each unavailable dependency."""
     request_hash = selection.request_hash
     item: dict[str, Any] = {"request_hash": request_hash, "reason": selection.reason}
+    dependencies: list[dict[str, Any]] = []
+    has_missing_dependency = False
+    has_corrupted_dependency = False
+    manifest = _load_record_manifest(store, request_hash)
+    artifact_dir = store.root / "artifacts" / request_hash
+
+    if manifest is not None:
+        artifacts = manifest.get("artifacts", [])
+        if not isinstance(artifacts, list):
+            artifacts = []
+            has_corrupted_dependency = True
+            dependencies.append(
+                {"path": None, "status": DELIVERY_CORRUPTED, "detail": "artifact list is invalid"}
+            )
+        for entry in artifacts:
+            if not isinstance(entry, dict):
+                has_corrupted_dependency = True
+                dependencies.append(
+                    {"path": None, "status": DELIVERY_CORRUPTED, "detail": "artifact entry is invalid"}
+                )
+                continue
+            dependency = {
+                "path": entry.get("path"),
+                "sha256": entry.get("sha256"),
+                "size": entry.get("size"),
+            }
+            source = artifact_dir / str(entry.get("path", ""))
+            try:
+                data = source.read_bytes()
+                if len(data) != entry.get("size") or hashlib.sha256(data).hexdigest() != entry.get("sha256"):
+                    raise ValueError("digest or size mismatch")
+                dependency["status"] = DELIVERY_COMPLETE
+            except FileNotFoundError:
+                dependency.update(status=DELIVERY_MISSING, detail="artifact file is absent")
+                has_missing_dependency = True
+            except (OSError, ValueError, TypeError) as exc:
+                dependency.update(status=DELIVERY_CORRUPTED, detail=str(exc))
+                has_corrupted_dependency = True
+            dependencies.append(dependency)
 
     complete = store._load_complete(request_hash)
     if complete is not None:
-        manifest = _load_record_manifest(store, request_hash) or {}
+        assert manifest is not None
         recorded_inputs = {
             entry["name"]: entry["sha256"]
             for entry in manifest.get("request", {}).get("inputs", [])
@@ -98,24 +140,37 @@ def plan_item(store: RunStore, selection: FreezeSelection) -> dict[str, Any]:
             return item
         item.update(
             status=STATUS_CONFIRMED,
+            delivery_status=DELIVERY_COMPLETE,
             detail="record verified against artifacts",
-            artifacts=[entry["path"] for entry in manifest.get("artifacts", [])],
+            dependencies=dependencies,
         )
         return item
 
     basis = store._takeover_basis(request_hash) or {}
-    if basis.get("artifacts_without_record"):
+    if manifest is None and basis.get("artifacts_without_record"):
         item.update(
             status=STATUS_UNPROVEN,
+            delivery_status=DELIVERY_MISSING,
             detail="artifacts exist but no trustworthy record proves their origin",
         )
         return item
-    if basis.get("record_failed_verification"):
-        item.update(status=STATUS_NEEDS_REDO, detail="record failed artifact verification")
-    elif basis.get("orphaned_attempts") or basis.get("stale_staging_dirs"):
-        item.update(status=STATUS_NEEDS_REDO, detail="earlier stages never finished")
+    if manifest is None:
+        item.update(status=STATUS_NEEDS_REDO, delivery_status=DELIVERY_MISSING, detail="no record found")
+    elif has_corrupted_dependency:
+        item.update(
+            status=STATUS_NEEDS_REDO,
+            delivery_status=DELIVERY_CORRUPTED,
+            detail="one or more artifacts failed verification",
+        )
+    elif has_missing_dependency:
+        item.update(
+            status=STATUS_NEEDS_REDO,
+            delivery_status=DELIVERY_MISSING,
+            detail="one or more required artifacts are absent",
+        )
     else:
-        item.update(status=STATUS_NEEDS_REDO, detail="no record found")
+        item.update(status=STATUS_NEEDS_REDO, delivery_status=DELIVERY_MISSING, detail="record is not reusable")
+    item["dependencies"] = dependencies
     if basis:
         item["evidence"] = basis
     return item
@@ -127,6 +182,7 @@ def plan_freeze(store: RunStore, selections: list[FreezeSelection]) -> dict[str,
         "schema_version": FREEZE_SCHEMA_VERSION,
         "kind": "freeze-plan",
         "freezable": all(item["status"] == STATUS_CONFIRMED for item in items),
+        "partially_available": any(item["status"] == STATUS_CONFIRMED for item in items),
         "items": items,
     }
 
@@ -165,7 +221,7 @@ def _diff_selections(
 def load_package_manifest(package_dir: str | Path) -> dict[str, Any]:
     manifest_path = Path(package_dir) / "freeze-manifest.json"
     manifest = json.loads(manifest_path.read_bytes())
-    if manifest.get("schema_version") != FREEZE_SCHEMA_VERSION:
+    if manifest.get("schema_version") not in ("freeze-package/v1", FREEZE_SCHEMA_VERSION):
         raise ValueError("unsupported freeze package schema in " + str(manifest_path))
     return manifest
 
@@ -176,13 +232,9 @@ def freeze(
     output_root: str | Path,
     supersedes: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Publish an immutable freeze package for confirmed selections.
-
-    Dependencies are re-verified at freeze time; any selection that is not
-    confirmed aborts the whole freeze and is reported as undeliverable.
-    """
+    """Publish an immutable package containing every currently healthy candidate."""
     report = plan_freeze(store, selections)
-    if not report["freezable"]:
+    if not report["partially_available"]:
         raise FreezeError(report)
 
     previous_manifest: dict[str, Any] | None = None
@@ -190,19 +242,27 @@ def freeze(
         previous_manifest = load_package_manifest(supersedes)
 
     selection_entries: list[dict[str, Any]] = []
+    candidate_entries: list[dict[str, Any]] = []
     record_hashes: list[str] = []
     blobs: dict[str, Path] = {}
-    for selection in selections:
+    for selection, item in zip(selections, report["items"]):
         manifest = _load_record_manifest(store, selection.request_hash)
-        assert manifest is not None  # guaranteed by plan_freeze
-        parameters = manifest.get("request", {}).get("parameters", {})
+        parameters = manifest.get("request", {}).get("parameters", {}) if manifest else {}
         selection_entries.append(selection.manifest_entry(parameters))
+        candidate_entry = {
+            "request_hash": selection.request_hash,
+            "status": item.get("delivery_status", DELIVERY_MISSING),
+            "detail": item.get("detail", ""),
+            "dependencies": item.get("dependencies", []),
+        }
+        candidate_entries.append(candidate_entry)
+        if item["status"] != STATUS_CONFIRMED or manifest is None:
+            continue
         record_hashes.append(selection.request_hash)
         artifact_dir = store.root / "artifacts" / selection.request_hash
         for entry in manifest["artifacts"]:
             sha = entry["sha256"]
             source = artifact_dir / entry["path"]
-            # Content-identical artifacts shared across candidates are stored once.
             blobs.setdefault(sha, source)
 
     record_hashes = sorted(set(record_hashes))
@@ -212,6 +272,7 @@ def freeze(
     identity_payload = {
         "schema_version": FREEZE_SCHEMA_VERSION,
         "selections": selection_entries,
+        "candidates": candidate_entries,
         "records": record_hashes,
         "artifacts": artifact_entries,
         "supersedes": previous_manifest["package_id"] if previous_manifest else None,
@@ -279,7 +340,17 @@ def freeze(
         "package_id": package_id,
         "version": version,
         "path": str(target),
+        "complete": report["freezable"],
         "frozen": record_hashes,
+        "pending": [
+            {
+                "request_hash": item["request_hash"],
+                "status": item["delivery_status"],
+                "detail": item["detail"],
+            }
+            for item in report["items"]
+            if item["status"] != STATUS_CONFIRMED
+        ],
         "undeliverable": [],
         "artifact_blobs": len(blobs),
     }
@@ -288,10 +359,10 @@ def freeze(
 def import_package(store: RunStore, package_dir: str | Path) -> dict[str, Any]:
     """Verify a freeze package item by item and install records into a store.
 
-    Re-importing the same package is idempotent: records already present and
-    verified are reported as already_present and no duplicate provenance is
-    created. Any failed item keeps the package from being marked as a
-    verified complete experiment.
+    Candidates install independently. Missing or corrupted candidates are
+    reported with their declared reason, while complete candidates remain
+    reusable. A different already-used record version creates a conflict audit
+    entry and is never overwritten.
     """
     package_dir = Path(package_dir)
     manifest = load_package_manifest(package_dir)
@@ -312,9 +383,30 @@ def import_package(store: RunStore, package_dir: str | Path) -> dict[str, Any]:
             item.update(status="failed", detail=str(exc))
         artifact_items.append(item)
 
+    pending_status = {
+        entry.get("request_hash"): entry
+        for entry in manifest.get("candidates", [])
+        if isinstance(entry, dict) and entry.get("status") in (DELIVERY_MISSING, DELIVERY_CORRUPTED)
+    }
+    record_hashes = manifest.get("records", [])
+    if not isinstance(record_hashes, list):
+        record_hashes = []
+    if not manifest.get("candidates"):
+        pending_status = {}
+
     record_items: list[dict[str, Any]] = []
-    for request_hash in manifest.get("records", []):
-        item = {"request_hash": request_hash}
+    candidate_keys = sorted(set(record_hashes) | set(pending_status))
+    for request_hash in candidate_keys:
+        item: dict[str, Any] = {"request_hash": request_hash}
+        pending = pending_status.get(request_hash)
+        if pending is not None:
+            item.update(
+                status=pending.get("status", DELIVERY_MISSING),
+                detail=pending.get("detail", "candidate was not delivered completely"),
+                dependencies=pending.get("dependencies", []),
+            )
+            record_items.append(item)
+            continue
         record_path = package_dir / "records" / (request_hash + ".json")
         try:
             record = json.loads(record_path.read_bytes())
@@ -332,6 +424,28 @@ def import_package(store: RunStore, package_dir: str | Path) -> dict[str, Any]:
                 if sha not in verified_blobs:
                     raise ValueError("artifact " + artifact["path"] + " missing or unverified")
                 contents[artifact["path"]] = verified_blobs[sha]
+            existing_path = store.root / "requests" / (request_hash + ".json")
+            if existing_path.is_file() and store._load_complete(request_hash) is not None:
+                existing = json.loads(existing_path.read_bytes())
+                existing_artifacts = [
+                    {key: artifact.get(key) for key in ("path", "size", "sha256")}
+                    for artifact in existing.get("artifacts", [])
+                    if isinstance(artifact, dict)
+                ]
+                incoming_artifacts = [
+                    {key: artifact.get(key) for key in ("path", "size", "sha256")}
+                    for artifact in record.get("artifacts", [])
+                    if isinstance(artifact, dict)
+                ]
+                if existing_artifacts != incoming_artifacts:
+                    item.update(
+                        status="conflict",
+                        detail="incoming record uses a different artifact version than the record already in use",
+                        existing_artifacts=existing_artifacts,
+                        incoming_artifacts=incoming_artifacts,
+                    )
+                    record_items.append(item)
+                    continue
             summary = store.install_record(record, contents)
             item["status"] = "already_present" if summary.reused else "installed"
         except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
@@ -341,6 +455,15 @@ def import_package(store: RunStore, package_dir: str | Path) -> dict[str, Any]:
     verified_complete = bool(record_items) and all(
         item["status"] == "verified" for item in artifact_items
     ) and all(item["status"] in ("installed", "already_present") for item in record_items)
+    store.append_delivery_event(
+        {
+            "event": "import_package",
+            "package_id": manifest.get("package_id"),
+            "version": manifest.get("version"),
+            "verified_complete": verified_complete,
+            "candidates": record_items,
+        }
+    )
     return {
         "schema_version": FREEZE_SCHEMA_VERSION,
         "kind": "import-report",
@@ -349,5 +472,7 @@ def import_package(store: RunStore, package_dir: str | Path) -> dict[str, Any]:
         "artifacts": artifact_items,
         "records": record_items,
         "selections": manifest.get("selections", []),
+        "candidates": manifest.get("candidates", []),
+        "audit_path": str(store.root / "delivery-imports.jsonl"),
         "verified_complete": verified_complete,
     }

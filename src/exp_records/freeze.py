@@ -19,6 +19,10 @@ STATUS_CONFIRMED = "confirmed"
 STATUS_NEEDS_REDO = "needs_redo"
 STATUS_UNPROVEN = "unproven"
 
+STATE_COMPLETE = "complete"
+STATE_MISSING = "missing"
+STATE_DAMAGED = "damaged"
+
 
 @dataclass(frozen=True)
 class FreezeSelection:
@@ -55,6 +59,17 @@ class FreezeError(RuntimeError):
         self.report = report
         undeliverable = [item["request_hash"] for item in report["items"] if item["status"] != STATUS_CONFIRMED]
         super().__init__("selections not deliverable: " + ", ".join(undeliverable))
+
+
+def _delivery_state(item: dict[str, Any]) -> str:
+    """Map a plan item to a delivery state: complete / missing / damaged."""
+    if item["status"] == STATUS_CONFIRMED:
+        return STATE_COMPLETE
+    if item["status"] == STATUS_UNPROVEN:
+        return STATE_DAMAGED
+    if item.get("detail") == "record failed artifact verification":
+        return STATE_DAMAGED
+    return STATE_MISSING
 
 
 def _record_manifest_path(store: RunStore, request_hash: str) -> Path:
@@ -175,15 +190,35 @@ def freeze(
     selections: list[FreezeSelection],
     output_root: str | Path,
     supersedes: str | Path | None = None,
+    allow_partial: bool = False,
 ) -> dict[str, Any]:
     """Publish an immutable freeze package for confirmed selections.
 
     Dependencies are re-verified at freeze time; any selection that is not
-    confirmed aborts the whole freeze and is reported as undeliverable.
+    confirmed aborts the whole freeze and is reported as undeliverable, unless
+    allow_partial is set. A partial package still delivers every healthy
+    candidate and records each undelivered candidate as missing or damaged in
+    the manifest, so a later supplement package can fill the gaps.
     """
     report = plan_freeze(store, selections)
-    if not report["freezable"]:
+    if not report["freezable"] and not allow_partial:
         raise FreezeError(report)
+
+    confirmed_hashes = {
+        item["request_hash"] for item in report["items"] if item["status"] == STATUS_CONFIRMED
+    }
+    candidate_states = [
+        {
+            "request_hash": item["request_hash"],
+            "state": _delivery_state(item),
+            "plan_status": item["status"],
+            "detail": item.get("detail", ""),
+            "reason": item.get("reason", ""),
+        }
+        for item in report["items"]
+        if item["request_hash"] not in confirmed_hashes
+    ]
+    candidate_states.sort(key=lambda entry: entry["request_hash"])
 
     previous_manifest: dict[str, Any] | None = None
     if supersedes is not None:
@@ -193,8 +228,10 @@ def freeze(
     record_hashes: list[str] = []
     blobs: dict[str, Path] = {}
     for selection in selections:
+        if selection.request_hash not in confirmed_hashes:
+            continue
         manifest = _load_record_manifest(store, selection.request_hash)
-        assert manifest is not None  # guaranteed by plan_freeze
+        assert manifest is not None  # guaranteed by plan_freeze for confirmed items
         parameters = manifest.get("request", {}).get("parameters", {})
         selection_entries.append(selection.manifest_entry(parameters))
         record_hashes.append(selection.request_hash)
@@ -214,6 +251,7 @@ def freeze(
         "selections": selection_entries,
         "records": record_hashes,
         "artifacts": artifact_entries,
+        "candidate_states": candidate_states,
         "supersedes": previous_manifest["package_id"] if previous_manifest else None,
     }
     package_id = "freeze-" + hashlib.sha256(canonical_json(identity_payload)).hexdigest()[:24]
@@ -280,7 +318,7 @@ def freeze(
         "version": version,
         "path": str(target),
         "frozen": record_hashes,
-        "undeliverable": [],
+        "undeliverable": candidate_states,
         "artifact_blobs": len(blobs),
     }
 
@@ -290,32 +328,44 @@ def import_package(store: RunStore, package_dir: str | Path) -> dict[str, Any]:
 
     Re-importing the same package is idempotent: records already present and
     verified are reported as already_present and no duplicate provenance is
-    created. Any failed item keeps the package from being marked as a
-    verified complete experiment.
+    created. Every candidate ends up with an explicit state: complete
+    (installed/already_present), missing (content temporarily absent), damaged
+    (content present but failed verification), or conflict (a different
+    version is already in use locally and is left untouched, with both sides
+    recorded for audit). Undelivered candidates never masquerade as reusable
+    records and never block healthy candidates from being imported. Any
+    non-complete item keeps the package from being marked verified_complete.
     """
     package_dir = Path(package_dir)
     manifest = load_package_manifest(package_dir)
 
     artifact_items: list[dict[str, Any]] = []
     verified_blobs: dict[str, bytes] = {}
+    blob_states: dict[str, str] = {}
     for entry in manifest.get("artifacts", []):
         sha = entry["sha256"]
         blob_path = package_dir / "artifacts" / sha
         item: dict[str, Any] = {"sha256": sha}
-        try:
+        if not blob_path.is_file():
+            item.update(status=STATE_MISSING, detail="artifact blob absent from package")
+        else:
             data = blob_path.read_bytes()
             if hashlib.sha256(data).hexdigest() != sha or len(data) != entry["size"]:
-                raise ValueError("digest mismatch")
-            verified_blobs[sha] = data
-            item["status"] = "verified"
-        except (OSError, ValueError) as exc:
-            item.update(status="failed", detail=str(exc))
+                item.update(status=STATE_DAMAGED, detail="artifact digest or size mismatch")
+            else:
+                verified_blobs[sha] = data
+                item["status"] = "verified"
+        blob_states[sha] = item["status"]
         artifact_items.append(item)
 
     record_items: list[dict[str, Any]] = []
     for request_hash in manifest.get("records", []):
         item = {"request_hash": request_hash}
         record_path = package_dir / "records" / (request_hash + ".json")
+        if not record_path.is_file():
+            item.update(status=STATE_MISSING, detail="record file absent from package")
+            record_items.append(item)
+            continue
         try:
             record = json.loads(record_path.read_bytes())
             if record.get("record_id") != request_hash:
@@ -326,21 +376,80 @@ def import_package(store: RunStore, package_dir: str | Path) -> dict[str, Any]:
             recomputed = hashlib.sha256(canonical_json(payload)).hexdigest()
             if recomputed != request_hash:
                 raise ValueError("record request payload does not match request hash")
-            contents: dict[str, bytes] = {}
-            for artifact in record.get("artifacts", []):
-                sha = artifact["sha256"]
-                if sha not in verified_blobs:
-                    raise ValueError("artifact " + artifact["path"] + " missing or unverified")
+        except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            item.update(status=STATE_DAMAGED, detail=str(exc))
+            record_items.append(item)
+            continue
+
+        contents: dict[str, bytes] = {}
+        dependency_state: str | None = None
+        for artifact in record.get("artifacts", []):
+            sha = artifact["sha256"]
+            if sha in verified_blobs:
                 contents[artifact["path"]] = verified_blobs[sha]
+                continue
+            state = blob_states.get(sha, STATE_MISSING)
+            dependency_state = dependency_state or state
+            item["missing_artifact" if state == STATE_MISSING else "damaged_artifact"] = artifact[
+                "path"
+            ]
+        if dependency_state is not None:
+            item.update(
+                status=dependency_state,
+                detail="artifact dependencies not satisfied in this package",
+            )
+            record_items.append(item)
+            continue
+
+        existing = store._load_complete(request_hash)
+        if existing is not None:
+            try:
+                local_record = json.loads(existing.record_path.read_bytes())
+            except (OSError, json.JSONDecodeError):
+                local_record = None
+            if local_record is not None and canonical_json(local_record) == canonical_json(record):
+                item["status"] = "already_present"
+            else:
+                item.update(
+                    status="conflict",
+                    detail="a different version is already installed and in use; it was not overwritten",
+                    local_artifacts=local_record.get("artifacts") if local_record else None,
+                    incoming_artifacts=record.get("artifacts"),
+                )
+            record_items.append(item)
+            continue
+
+        try:
             summary = store.install_record(record, contents)
             item["status"] = "already_present" if summary.reused else "installed"
         except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
-            item.update(status="failed", detail=str(exc))
+            item.update(status=STATE_DAMAGED, detail=str(exc))
         record_items.append(item)
+
+    declared_states = manifest.get("candidate_states", [])
+    candidates = [
+        {
+            "request_hash": item["request_hash"],
+            "state": STATE_COMPLETE
+            if item["status"] in ("installed", "already_present")
+            else item["status"],
+            "detail": item.get("detail", ""),
+        }
+        for item in record_items
+    ] + [
+        {
+            "request_hash": entry["request_hash"],
+            "state": entry["state"],
+            "detail": entry.get("detail", ""),
+        }
+        for entry in declared_states
+    ]
 
     verified_complete = bool(record_items) and all(
         item["status"] == "verified" for item in artifact_items
-    ) and all(item["status"] in ("installed", "already_present") for item in record_items)
+    ) and all(
+        item["status"] in ("installed", "already_present") for item in record_items
+    ) and not declared_states
     return {
         "schema_version": FREEZE_SCHEMA_VERSION,
         "kind": "import-report",
@@ -348,6 +457,7 @@ def import_package(store: RunStore, package_dir: str | Path) -> dict[str, Any]:
         "version": manifest.get("version"),
         "artifacts": artifact_items,
         "records": record_items,
+        "candidates": candidates,
         "selections": manifest.get("selections", []),
         "verified_complete": verified_complete,
     }

@@ -33,8 +33,15 @@
  - 冻结前先预览：`freeze-plan` 把每个候选分类为 confirmed（记录与产物校验通过）、needs_redo（记录缺失、产物损坏、输入在选择后被替换或仍有阶段未结束）、unproven（只有产物没有可信记录）。任何非 confirmed 的候选都会使冻结中止并明确列出，不会把目录里现成的同名文件装进包，也不会混入其他候选未确认的结果。
  - 选择可以只采纳候选的一部分参数决定：`--selections` JSON 文件中每个条目支持 adopted_parameters（缺省为全部采纳）、reason（采用原因）和 expected_inputs（选择时看到的输入摘要，用于发现输入被替换）。内容相同但来源不同的材料各自记录采用原因。
  - 冻结时重新核对依赖；多个候选共享的内容相同产物在包内按 SHA-256 只存一份。包写入暂存目录后原子发布，package_id 由内容决定，已发布的包不可变，重复冻结同一内容会报错。
- - 后续重新计算或补齐缺失内容时，用 `--supersedes` 指向上一版包生成新版本；新清单记录 version、supersedes 和 changes（新增、移除、替换的候选及依据），原版本保持不变。
- - 接收者用 `import-package` 逐件验证：每个产物核对 SHA-256，每条记录重算请求哈希并核对产物引用，通过后才装入本地存储。重复导入同一包幂等，已存在的记录标记 already_present，不产生第二套来源。任何一件缺失或校验失败，整包不得标为 verified_complete。导入的记录可直接被 `run` 复用，从最终结果追溯到实际采用的原实验，无需猜原文件路径。
+- 后续重新计算或补齐缺失内容时，用 `--supersedes` 指向上一版包生成新版本；新清单记录 version、supersedes 和 changes（新增、移除、替换的候选及依据），原版本保持不变。
+- 接收者用 `import-package` 逐件验证：每个产物核对 SHA-256，每条记录重算请求哈希并核对产物引用，通过后才装入本地存储。重复导入同一包幂等，已存在的记录标记 already_present，不产生第二套来源。任何一件缺失或校验失败，整包不得标为 verified_complete。导入的记录可直接被 `run` 复用，从最终结果追溯到实际采用的原实验，无需猜原文件路径。
+
+## 部分交付与补齐
+
+- `freeze --allow-partial` 在部分候选不可交付时仍发布包：健康候选照常打包，不可交付候选写入清单的 candidate_states，状态明确区分为 missing（暂缺：无记录或阶段未结束）与 damaged（损坏：记录或产物校验失败、来源不可信），不会混入健康候选的产物。
+- 导入报告为每个候选给出明确状态：complete（installed/already_present）、missing（包内缺记录或缺产物）、damaged（摘要不符）、conflict（本地已在使用不同版本）。缺失或损坏只影响对应候选，健康候选照常导入并可被 `run` 复用；缺失内容永远不会被当作可复用记录。
+- 冲突内容不覆盖本地已使用的版本，报告中同时留下本地与 incoming 的产物摘要供核对。
+- 接收方可先导入部分包，再导入 `--supersedes` 的补充包：重叠候选保持唯一（already_present），缺口按补齐安装；只有依赖齐备的请求才会被复用，原始机器目录即使已删除也不影响复用。已发布的旧包保持不可变。
  
      python -m exp_records.cli freeze-plan --store ./example-store --select <hash>
      python -m exp_records.cli freeze --store ./example-store --output ./packages --select <hash>

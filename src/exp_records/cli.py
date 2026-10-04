@@ -49,6 +49,11 @@ def build_parser() -> argparse.ArgumentParser:
     freeze_cmd.add_argument("--select", dest="selects", action="append", default=[], metavar="HASH")
     freeze_cmd.add_argument("--selections", type=Path, help="JSON file with selection objects")
     freeze_cmd.add_argument("--supersedes", type=Path, help="previous package directory")
+    freeze_cmd.add_argument(
+        "--allow-partial",
+        action="store_true",
+        help="deliver healthy candidates even when others are missing or damaged",
+    )
 
     import_cmd = subparsers.add_parser("import-package", help="verify and import a freeze package")
     import_cmd.add_argument("--store", required=True, type=Path)
@@ -114,6 +119,7 @@ def main(argv: list[str] | None = None) -> int:
                 load_selections(args),
                 args.output,
                 supersedes=args.supersedes,
+                allow_partial=args.allow_partial,
             )
         except FreezeError as exc:
             print(json.dumps(exc.report, ensure_ascii=False, sort_keys=True, indent=2))

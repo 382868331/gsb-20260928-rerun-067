@@ -183,7 +183,7 @@ class FreezeTests(unittest.TestCase):
         receiver = RunStore(self.root / "receiver", shared_backend)
         result = import_package(receiver, package_dir)
         self.assertFalse(result["verified_complete"])
-        failed = [item for item in result["artifacts"] if item["status"] == "failed"]
+        failed = [item for item in result["artifacts"] if item["status"] == "missing"]
         self.assertEqual(len(failed), 1)
         # Nothing was installed from the incomplete package.
         self.assertFalse(list((self.root / "receiver" / "requests").glob("*.json")))
@@ -198,7 +198,7 @@ class FreezeTests(unittest.TestCase):
         receiver = RunStore(self.root / "receiver", shared_backend)
         result = import_package(receiver, package_dir)
         self.assertFalse(result["verified_complete"])
-        self.assertEqual(result["records"][0]["status"], "failed")
+        self.assertEqual(result["records"][0]["status"], "damaged")
 
 
 if __name__ == "__main__":

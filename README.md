@@ -53,6 +53,19 @@
 - 包完全无法读取（如清单损坏）的失败尝试同样入历史，`package_id` 为 null 并记录异常原因。
 - 查询入口：`python -m exp_records.cli import-history --store ./receiver-store [--package <package_id>] [--request <request_hash>]`；Python API 为 `ImportHistory(store).query(package_id=..., request_hash=...)`，二者只读持久化日志。
 
+## 接收端分批补齐计划
+
+`replenish-plan` 在接收端根据本地已验证内容和依赖关系生成最小待请求集合，并把缺口分批安排给发送端补发；整个规划只依赖接收者自己的 store，不需要发送端目录或原始包目录。
+
+- 待请求集合来自一份 wants 清单（JSON 数组，每项含 request_hash、depends_on、priority、size_bytes）；本地已验证的内容直接标为 installable，不再请求。同一内容被多个请求共享（重复条目或共享依赖）只计一次，重复导入与乱序补发不会重复占用已验证容量。
+- 分批按优先级（高者优先）与传输预算（`--budget` 每批字节数）安排；`--max-batches` 限制本轮批次数，预算耗尽的请求标记 deferred 留待后续批次；单条超过预算的内容独占一批并标记 over_budget。
+- 依赖尚缺失时，上层内容即使已在本地验证也标记 held（保留待用），不会被标为可安装；每个不可安装条目都附 blocking_chain，逐跳解释阻塞原因（未交付、校验失败、依赖未列入请求、循环依赖）。
+- 已下载内容校验失败（damaged）时，只有依赖它的请求回到待补齐，独立请求保持 installable；重新补发并通过校验后自动恢复为 installable。
+- 计划状态持久化在接收 store 的 `replenish/plan-state.json`（原子写入）；不带 `--wants` 重开时从持久化状态继续生成剩余请求并解释阻塞链，发送端目录不存在也不影响。
+
+    python -m exp_records.cli replenish-plan --store ./receiver-store --wants wants.json --budget 1048576 --max-batches 4
+    python -m exp_records.cli replenish-plan --store ./receiver-store   # 从持久化状态恢复
+
     python -m exp_records.cli freeze-plan --store ./example-store --select <hash>
      python -m exp_records.cli freeze --store ./example-store --output ./packages --select <hash>
      python -m exp_records.cli import-package --store ./receiver-store --package ./packages/<package_id>

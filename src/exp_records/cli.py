@@ -10,6 +10,7 @@ from .backends import local_short_compute
 from .freeze import FreezeError, FreezeSelection, freeze, import_package, plan_freeze
 from .history import ImportHistory
 from .models import ExperimentRequest, InputSpec, default_environment
+from .replenish import ReplenishmentPlanner, load_wants
 from .store import RunStore
 
 
@@ -66,6 +67,26 @@ def build_parser() -> argparse.ArgumentParser:
     history_cmd.add_argument("--store", required=True, type=Path)
     history_cmd.add_argument("--package", help="filter by package_id")
     history_cmd.add_argument("--request", help="filter by request hash")
+
+    replenish_cmd = subparsers.add_parser(
+        "replenish-plan",
+        help="plan batched re-delivery of missing content on the receiver",
+    )
+    replenish_cmd.add_argument("--store", required=True, type=Path)
+    replenish_cmd.add_argument(
+        "--wants",
+        type=Path,
+        help="JSON file of wanted requests; omit to resume from persisted state",
+    )
+    replenish_cmd.add_argument(
+        "--budget", type=int, default=None, help="transfer budget in bytes per batch"
+    )
+    replenish_cmd.add_argument(
+        "--max-batches",
+        type=int,
+        default=None,
+        help="maximum batches this round; the rest is deferred",
+    )
     return parser
 
 
@@ -158,6 +179,25 @@ def main(argv: list[str] | None = None) -> int:
             request_hash=args.request,
         )
         print(json.dumps(entries, ensure_ascii=False, sort_keys=True, indent=2))
+        return 0
+    if args.command == "replenish-plan":
+        store = RunStore(args.store, local_short_compute)
+        planner = ReplenishmentPlanner(store)
+        if args.wants is not None:
+            plan = planner.build_plan(
+                load_wants(args.wants),
+                budget_bytes=args.budget,
+                max_batches=args.max_batches,
+            )
+        else:
+            try:
+                plan = planner.resume(
+                    budget_bytes=args.budget, max_batches=args.max_batches
+                )
+            except FileNotFoundError as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+        print(json.dumps(plan, ensure_ascii=False, sort_keys=True, indent=2))
         return 0
     raise SystemExit("unknown command: " + args.command)
 

@@ -57,6 +57,15 @@
      python -m exp_records.cli freeze --store ./example-store --output ./packages --select <hash>
      python -m exp_records.cli import-package --store ./receiver-store --package ./packages/<package_id>
  
+## 接收端缺失内容的分批补齐计划
+
+接收端用 `BackfillPlanner`（状态持久化在接收存储的 `backfill/state.json`，原子写入并 fsync）规划缺失内容的分批补齐，重开存储后即使发送端目录已删除也能继续生成剩余请求。
+
+- `backfill-register --store S --spec items.json` 声明想要的内容：`content_id`、`size`、`priority`、`dependencies`、`wanted`。重复注册幂等，只刷新元数据，不会撤销已验证内容。
+- `backfill-plan --store S --budget N [--max-batches M]` 根据本地已验证内容与依赖关系生成最小待请求集合（被多个请求共享的依赖只计一次），按优先级装入每批不超过预算的批次；超出 `--max-batches` 的内容列入 `deferred` 并标记 `budget_exhausted`。依赖未齐的内容保留在 `retained` 中并给出每条阻塞链（`blocking_chains`）与依赖环（`cycle`），不会被标为可安装；从未注册的缺失依赖同样只阻塞不装批。
+- `backfill-mark --store S --verified ID... --failed ID... [--reason ...]` 记录下载结果。已验证容量按内容集合计，重复导入与乱序补发不会重复占用；校验失败只让依赖它的请求回到待补齐，独立请求继续可用，替换内容重新验证后计划自动恢复。
+- 已通过 `import-package` 装入本地存储的记录会在规划时被自动采纳为已验证，不重复计容。
+
  ## 测试
 
     python -m unittest discover -s tests -v

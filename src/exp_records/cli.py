@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .backends import local_short_compute
+from .backfill import BackfillPlanner
 from .freeze import FreezeError, FreezeSelection, freeze, import_package, plan_freeze
 from .history import ImportHistory
 from .models import ExperimentRequest, InputSpec, default_environment
@@ -66,6 +67,32 @@ def build_parser() -> argparse.ArgumentParser:
     history_cmd.add_argument("--store", required=True, type=Path)
     history_cmd.add_argument("--package", help="filter by package_id")
     history_cmd.add_argument("--request", help="filter by request hash")
+
+    register_cmd = subparsers.add_parser(
+        "backfill-register", help="declare wanted content for the receiver backfill plan"
+    )
+    register_cmd.add_argument("--store", required=True, type=Path)
+    register_cmd.add_argument(
+        "--spec",
+        required=True,
+        type=Path,
+        help="JSON list of {content_id, size, priority, dependencies, wanted}",
+    )
+
+    plan_cmd = subparsers.add_parser(
+        "backfill-plan", help="compute batched backfill requests for missing content"
+    )
+    plan_cmd.add_argument("--store", required=True, type=Path)
+    plan_cmd.add_argument("--budget", required=True, type=int, help="per-batch byte budget")
+    plan_cmd.add_argument("--max-batches", type=int, default=None)
+
+    mark_cmd = subparsers.add_parser(
+        "backfill-mark", help="mark downloaded content verified or failed"
+    )
+    mark_cmd.add_argument("--store", required=True, type=Path)
+    mark_cmd.add_argument("--verified", action="append", default=[], metavar="CONTENT_ID")
+    mark_cmd.add_argument("--failed", action="append", default=[], metavar="CONTENT_ID")
+    mark_cmd.add_argument("--reason", default="")
     return parser
 
 
@@ -158,6 +185,41 @@ def main(argv: list[str] | None = None) -> int:
             request_hash=args.request,
         )
         print(json.dumps(entries, ensure_ascii=False, sort_keys=True, indent=2))
+        return 0
+    if args.command == "backfill-register":
+        planner = BackfillPlanner(RunStore(args.store, local_short_compute))
+        spec = json.loads(Path(args.spec).read_text(encoding="utf-8"))
+        for entry in spec:
+            planner.register(
+                entry["content_id"],
+                size=entry.get("size", 0),
+                priority=entry.get("priority", 0),
+                dependencies=entry.get("dependencies", []),
+                wanted=entry.get("wanted", True),
+            )
+        planner.save()
+        print(json.dumps({"registered": len(spec)}, ensure_ascii=False, sort_keys=True))
+        return 0
+    if args.command == "backfill-plan":
+        planner = BackfillPlanner(RunStore(args.store, local_short_compute))
+        report = planner.plan_batches(args.budget, max_batches=args.max_batches)
+        planner.save()
+        print(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2))
+        return 0
+    if args.command == "backfill-mark":
+        planner = BackfillPlanner(RunStore(args.store, local_short_compute))
+        for content_id in args.verified:
+            planner.mark_verified(content_id)
+        failures = [planner.mark_failed(content_id, args.reason) for content_id in args.failed]
+        planner.save()
+        print(
+            json.dumps(
+                {"verified": args.verified, "failed": failures},
+                ensure_ascii=False,
+                sort_keys=True,
+                indent=2,
+            )
+        )
         return 0
     raise SystemExit("unknown command: " + args.command)
 
